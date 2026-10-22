@@ -1,0 +1,49 @@
+# Environment variables and local secrets
+.env
+.env.*
+*.env
+*.env.*
+.envrc
+.envrc.*
+.dev.vars
+.dev.vars.*
+
+# Keep redacted environment templates in version control
+!.env.example
+!.env.sample
+!.env.template
+!*.env.example
+!*.env.sample
+!*.env.template
+
+# Other common secret and credential files
+*.secret
+*.secrets
+secrets/
+credentials/
+
+# Python virtual environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node.js and TypeScript dependencies/build output
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# IDE and editor-local files
+.idea/
+.vscode/
+*.iml
+
+# Operating-system files
+.DS_Store
+Thumbs.db
