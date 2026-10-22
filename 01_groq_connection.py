@@ -31,4 +31,5 @@ response = client.chat.completions.create(
 
 
 # 4. Print the AI's answer
-print(response.choices[0].message.content)
+answer = response.choices[0].message.content
+print("AI Answer:", answer)
