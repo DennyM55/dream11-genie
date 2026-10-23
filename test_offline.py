@@ -14,7 +14,14 @@ from langchain_core.messages import AIMessage
 from unittest.mock import patch
 
 import agent
-from agent import _make_llm, pick_team_demo, rate_limit_message
+from agent import (
+    GroqMalformedJSONError,
+    GroqTruncatedOutputError,
+    GroqValidationError,
+    _make_llm,
+    pick_team_demo,
+    rate_limit_message,
+)
 from data import PLAYERS, SQUADS
 from schema import Pick, Team
 from tools import get_match_squads, get_player_stats, search_form, get_pitch_report
@@ -340,7 +347,7 @@ def test_streamlit_success_and_safe_errors():
             AuthenticationError("sensitive", response=httpx.Response(401, request=request), body={}),
             RateLimitError("sensitive", response=httpx.Response(429, request=request), body={"error": {"message": "tokens per day"}}),
             APITimeoutError(request=request),
-            ValueError("sensitive malformed JSON"),
+            GroqValidationError("sensitive invalid team"),
         ]
         for error in errors:
             with patch("agent.pick_team_demo", side_effect=error) as picker:
@@ -351,7 +358,7 @@ def test_streamlit_success_and_safe_errors():
             assert not app.table
 
 
-def test_streamlit_distinguishes_truncation_and_http_400():
+def test_streamlit_distinguishes_output_and_http_errors():
     import httpx
     from groq import BadRequestError
     from streamlit.testing.v1 import AppTest
@@ -364,7 +371,9 @@ def test_streamlit_distinguishes_truncation_and_http_400():
     )
     with patch.dict(os.environ, {"GROQ_API_KEY": "offline-test-only"}):
         for error, public_text in [
-            (ValueError("Groq output was truncated (finish_reason=length)."), "truncated"),
+            (GroqTruncatedOutputError("sensitive"), "truncated"),
+            (GroqMalformedJSONError("sensitive"), "malformed JSON"),
+            (GroqValidationError("sensitive"), "failed team validation"),
             (bad_request, "HTTP 400"),
         ]:
             app = AppTest.from_file("app.py").run()
@@ -447,7 +456,7 @@ if __name__ == "__main__":
         test_demo_repairs_metadata_and_captaincy,
         test_demo_provider_error_never_retries,
         test_streamlit_success_and_safe_errors,
-        test_streamlit_distinguishes_truncation_and_http_400,
+        test_streamlit_distinguishes_output_and_http_errors,
         test_tools,
         test_groq_client_safety_settings,
         test_demo_uses_one_request_and_repairs_locally,

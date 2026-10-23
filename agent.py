@@ -39,6 +39,23 @@ truststore.inject_into_ssl()
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_PARSE_ATTEMPTS = 1
 
+
+class GroqOutputError(ValueError):
+    """Base class for unusable Groq output that must not be retried."""
+
+
+class GroqTruncatedOutputError(GroqOutputError):
+    """The provider stopped before completing its response."""
+
+
+class GroqMalformedJSONError(GroqOutputError):
+    """The provider returned text that is not valid JSON."""
+
+
+class GroqValidationError(GroqOutputError):
+    """The JSON parsed, but it cannot produce a rule-valid XI."""
+
+
 DEMO_SYSTEM = """Select a fantasy cricket XI using only the supplied SAMPLE data.
 Return ONLY JSON: {"players":[0,1,2],"captain":0,"vice_captain":1,"strategy":"Short grounded strategy"}.
 Use exactly 11 unique integer player IDs from the supplied pool; the example is abbreviated.
@@ -288,9 +305,13 @@ def _parse_demo_response(response, match: str) -> Team:
     """Reject incomplete output; map fixture-local IDs to canonical sample data."""
     finish = response.response_metadata.get("finish_reason")
     if finish == "length":
-        raise ValueError("Groq output was truncated (finish_reason=length). No retry was attempted.")
+        raise GroqTruncatedOutputError(
+            "Groq output was truncated (finish_reason=length). No retry was attempted."
+        )
     if finish != "stop":
-        raise ValueError("Groq response did not finish normally. No retry was attempted.")
+        raise GroqTruncatedOutputError(
+            "Groq response did not finish normally. No retry was attempted."
+        )
     content = response.content
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Groq returned an empty response. No retry was attempted.")
@@ -302,17 +323,25 @@ def _parse_demo_response(response, match: str) -> Team:
     try:
         payload = json.loads(content)
     except ValueError as error:
-        raise ValueError("Groq returned malformed JSON. No retry was attempted.") from error
+        raise GroqMalformedJSONError(
+            "Groq returned malformed JSON. No retry was attempted."
+        ) from error
     pool = [name for squad in SQUADS[match]["teams"].values() for name in squad]
     if not isinstance(payload, dict) or not {"players", "captain", "vice_captain", "strategy"} <= payload.keys():
-        raise ValueError("Groq JSON is missing required fields. No retry was attempted.")
+        raise GroqValidationError(
+            "Groq JSON is missing required fields. No retry was attempted."
+        )
     ids = payload["players"]
     if not isinstance(ids, list) or len(ids) != 11:
-        raise ValueError("Groq must return exactly 11 player IDs. No retry was attempted.")
+        raise GroqValidationError(
+            "Groq must return exactly 11 player IDs. No retry was attempted."
+        )
     if any(type(i) is not int or not 0 <= i < len(pool) for i in ids + [payload["captain"], payload["vice_captain"]]):
-        raise ValueError("Groq returned invalid sample player IDs. No retry was attempted.")
+        raise GroqValidationError(
+            "Groq returned invalid sample player IDs. No retry was attempted."
+        )
     if not isinstance(payload["strategy"], str) or not payload["strategy"].strip():
-        raise ValueError("Groq returned no strategy. No retry was attempted.")
+        raise GroqValidationError("Groq returned no strategy. No retry was attempted.")
     return Team.model_validate({
         "match": match,
         "captain": pool[payload["captain"]],
@@ -353,7 +382,9 @@ def pick_team_demo(match: str, *, verbose: bool = False) -> Team:
     final_issues, _ = validate_team(team)
     if final_issues:
         print(f"[demo] rejected category=validation details={'; '.join(final_issues)}")
-        raise ValueError("Could not produce a valid XI:\n" + _format_issues(final_issues))
+        raise GroqValidationError(
+            "Could not produce a valid XI:\n" + _format_issues(final_issues)
+        )
     return team
 
 

@@ -2,7 +2,14 @@ import os
 import streamlit as st
 from groq import APIConnectionError, APITimeoutError, AuthenticationError, BadRequestError, RateLimitError
 
-from agent import pick_team, pick_team_demo, rate_limit_message
+from agent import (
+    GroqMalformedJSONError,
+    GroqTruncatedOutputError,
+    GroqValidationError,
+    pick_team,
+    pick_team_demo,
+    rate_limit_message,
+)
 from data import PLAYERS, SQUADS
 from validate import validate_team
 
@@ -37,12 +44,15 @@ def _pick_team_safely(match, mode):
             f"provider_code={details.get('code', 'unknown')} provider_type={details.get('type', 'unknown')}"
         )
         st.error("Groq rejected the generation request (HTTP 400). No retry was attempted.")
-    except ValueError as error:
-        print(f"[streamlit] category=invalid_output detail={error}")
-        if "truncated" in str(error).lower() or "finish_reason=length" in str(error):
-            st.error("Groq's response was truncated before the XI JSON completed. No retry was attempted.")
-        else:
-            st.error("Groq returned malformed, incomplete, or invalid team data. No retry was attempted.")
+    except GroqTruncatedOutputError:
+        print("[streamlit] category=truncated_output")
+        st.error("Groq's response was truncated before the XI JSON completed. No retry was attempted.")
+    except GroqMalformedJSONError:
+        print("[streamlit] category=malformed_json")
+        st.error("Groq returned malformed JSON. No retry was attempted.")
+    except (GroqValidationError, ValueError):
+        print("[streamlit] category=validation")
+        st.error("Groq returned JSON that failed team validation. No retry was attempted.")
     except Exception as error:
         print(f"[streamlit] team generation failed: {type(error).__name__}")
         st.error("Groq returned an invalid response. No automatic retry was attempted.")
