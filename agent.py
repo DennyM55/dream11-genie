@@ -97,6 +97,7 @@ def _make_demo_llm() -> ChatGroq:
         model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
         temperature=0,
         reasoning_format="hidden",
+        reasoning_effort="low",
         max_tokens=2000,
         timeout=60,
         max_retries=0,
@@ -333,22 +334,25 @@ def pick_team_demo(match: str, *, verbose: bool = False) -> Team:
     response = _make_demo_llm().invoke(
         [("system", DEMO_SYSTEM), ("user", prompt)]
     )
-    if verbose:
-        # Numeric metadata only: never log response text, prompts, or credentials.
-        usage = response.usage_metadata or {}
-        finish = response.response_metadata.get("finish_reason")
-        safe_finish = finish if finish in {"stop", "length", "content_filter", "tool_calls"} else "other_or_missing"
-        print("[demo] finish_reason=" + safe_finish,
-              {key: value for key, value in usage.items()
-               if key in {"input_tokens", "output_tokens", "total_tokens"} and type(value) is int})
-    team = _parse_demo_response(response, match)
+    # Numeric metadata only: never log response text, prompts, headers, or credentials.
+    usage = response.usage_metadata or {}
+    finish = response.response_metadata.get("finish_reason")
+    safe_finish = finish if finish in {"stop", "length", "content_filter", "tool_calls"} else "other_or_missing"
+    safe_usage = {key: value for key, value in usage.items()
+                  if key in {"input_tokens", "output_tokens", "total_tokens"} and type(value) is int}
+    print(f"[demo] finish_reason={safe_finish} usage={safe_usage}")
+    try:
+        team = _parse_demo_response(response, match)
+    except ValueError as error:
+        print(f"[demo] rejected category={type(error).__name__} detail={error}")
+        raise
     issues, _ = validate_team(team)
     if issues:
-        if verbose:
-            print(f"[demo] repairing {len(issues)} validation issue(s) locally")
+        print(f"[demo] validation_issues={len(issues)} repair=local details={'; '.join(issues)}")
         team = repair_team(team)
     final_issues, _ = validate_team(team)
     if final_issues:
+        print(f"[demo] rejected category=validation details={'; '.join(final_issues)}")
         raise ValueError("Could not produce a valid XI:\n" + _format_issues(final_issues))
     return team
 

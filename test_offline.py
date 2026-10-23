@@ -68,6 +68,7 @@ def test_groq_client_safety_settings():
         demo = agent._make_demo_llm()
     assert demo.max_retries == 0
     assert demo.max_tokens == 2000
+    assert demo.reasoning_effort == "low"
     assert "response_format" not in demo.model_kwargs
     assert "tools" not in demo.model_kwargs
     assert ssl.SSLContext.__module__ == "truststore._api"
@@ -332,6 +333,8 @@ def test_streamlit_success_and_safe_errors():
         with patch("agent.pick_team_demo") as rerender_picker:
             app.run()
         rerender_picker.assert_not_called()
+        assert len(app.table[0].value) == 11
+        assert len(app.metric) == 3
         request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
         errors = [
             AuthenticationError("sensitive", response=httpx.Response(401, request=request), body={}),
@@ -346,6 +349,31 @@ def test_streamlit_success_and_safe_errors():
             assert not app.exception and app.error
             assert "sensitive" not in app.error[0].value
             assert not app.table
+
+
+def test_streamlit_distinguishes_truncation_and_http_400():
+    import httpx
+    from groq import BadRequestError
+    from streamlit.testing.v1 import AppTest
+
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    bad_request = BadRequestError(
+        "sensitive provider detail",
+        response=httpx.Response(400, request=request),
+        body={"error": {"code": "invalid_request_error", "type": "invalid_request_error"}},
+    )
+    with patch.dict(os.environ, {"GROQ_API_KEY": "offline-test-only"}):
+        for error, public_text in [
+            (ValueError("Groq output was truncated (finish_reason=length)."), "truncated"),
+            (bad_request, "HTTP 400"),
+        ]:
+            app = AppTest.from_file("app.py").run()
+            with patch("agent.pick_team_demo", side_effect=error) as picker:
+                app.button[0].click().run()
+            picker.assert_called_once()
+            assert not app.exception and app.error
+            assert public_text in app.error[0].value
+            assert "sensitive" not in app.error[0].value
 
 
 def test_incomplete_response_is_not_repaired_or_retried():
@@ -419,6 +447,7 @@ if __name__ == "__main__":
         test_demo_repairs_metadata_and_captaincy,
         test_demo_provider_error_never_retries,
         test_streamlit_success_and_safe_errors,
+        test_streamlit_distinguishes_truncation_and_http_400,
         test_tools,
         test_groq_client_safety_settings,
         test_demo_uses_one_request_and_repairs_locally,
