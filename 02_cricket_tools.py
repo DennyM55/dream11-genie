@@ -48,3 +48,24 @@ tools = [
 ]
 
 print(len(tools))
+
+import os
+from dotenv import load_dotenv
+from groq import Groq
+
+load_dotenv()
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+response = client.chat.completions.create(
+    model="openai/gpt-oss-20b",
+    messages=[{"role": "user", "content": "What is the pitch like?"}],
+    tools=tools
+)
+
+print(response.choices[0].message.tool_calls)
+
+tool_call = response.choices[0].message.tool_calls[0]
+
+if tool_call.function.name == "get_pitch_report":
+    result = get_pitch_report()
+    print("Tool result:", result)
