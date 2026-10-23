@@ -68,4 +68,22 @@ tool_call = response.choices[0].message.tool_calls[0]
 
 if tool_call.function.name == "get_pitch_report":
     result = get_pitch_report()
-    print("Tool result:", result)
+else:
+    raise ValueError("Unsupported tool")
+
+print("Tool result:", result)
+
+final_response = client.chat.completions.create(
+    model="openai/gpt-oss-20b",
+    messages=[
+        {"role": "user", "content": "What is the pitch like?"},
+        response.choices[0].message,
+        {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": result
+        }
+    ]
+)
+
+print(final_response.choices[0].message.content)
