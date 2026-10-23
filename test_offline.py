@@ -6,6 +6,7 @@ No Groq key or network access required.
 """
 from __future__ import annotations
 
+import json
 import ssl
 import os
 from unittest.mock import Mock
@@ -38,6 +39,13 @@ def _make_team(names, captain=None, vice_captain=None):
         players=picks,
         strategy="Offline test team",
     )
+
+
+def _demo_json(team):
+    pool = [name for squad in SQUADS[team.match]["teams"].values() for name in squad]
+    return json.dumps({"players": [pool.index(p.player) for p in team.players],
+                       "captain": pool.index(team.captain), "vice_captain": pool.index(team.vice_captain),
+                       "strategy": team.strategy})
 
 
 def test_tools():
@@ -77,7 +85,7 @@ def test_demo_uses_one_request_and_repairs_locally():
     ]
     invalid_team = _make_team(names)
     llm = Mock()
-    llm.invoke.return_value = AIMessage(content=invalid_team.model_dump_json(), response_metadata={"finish_reason": "stop"})
+    llm.invoke.return_value = AIMessage(content=_demo_json(invalid_team), response_metadata={"finish_reason": "stop"})
     with patch("agent._make_demo_llm", return_value=llm) as make_llm:
         repaired = pick_team_demo("CSK vs MI")
     make_llm.assert_called_once_with()
@@ -250,19 +258,21 @@ def _valid_sample():
 
 def test_demo_json_parsing():
     team = _valid_sample()
-    for content in (team.model_dump_json(), "```json\n" + team.model_dump_json() + "\n```"):
-        parsed = agent._parse_demo_response(AIMessage(content=content, response_metadata={"finish_reason": "stop"}))
-        assert parsed == team
-    for content, finish in [("{", "stop"), ("{}", "stop"), ("[]", "stop"), ("", "stop"), (team.model_dump_json(), "length")]:
+    for content in (_demo_json(team), "```json\n" + _demo_json(team) + "\n```"):
+        parsed = agent._parse_demo_response(AIMessage(content=content, response_metadata={"finish_reason": "stop"}), "CSK vs MI")
+        assert [p.player for p in parsed.players] == [p.player for p in team.players]
+        assert not validate_team(parsed)[0]
+        assert all(p.reason == PLAYERS[p.player]["note"] for p in parsed.players)
+    for content, finish in [("{", "stop"), ("{}", "stop"), ("[]", "stop"), ("", "stop"), (_demo_json(team), "length")]:
         try:
-            agent._parse_demo_response(AIMessage(content=content, response_metadata={"finish_reason": finish}))
+            agent._parse_demo_response(AIMessage(content=content, response_metadata={"finish_reason": finish}), "CSK vs MI")
         except ValueError:
             pass
         else:
             raise AssertionError("Unusable output accepted")
     team.players = []
     try:
-        agent._parse_demo_response(AIMessage(content=team.model_dump_json(), response_metadata={"finish_reason": "stop"}))
+        agent._parse_demo_response(AIMessage(content=_demo_json(team), response_metadata={"finish_reason": "stop"}), "CSK vs MI")
     except ValueError:
         pass
     else:
@@ -276,7 +286,7 @@ def test_demo_repairs_metadata_and_captaincy():
     team.vice_captain = team.captain
     assert validate_team(team)[0]
     llm = Mock()
-    llm.invoke.return_value = AIMessage(content=team.model_dump_json(), response_metadata={"finish_reason": "stop"})
+    llm.invoke.return_value = AIMessage(content=_demo_json(team), response_metadata={"finish_reason": "stop"})
     with patch("agent._make_demo_llm", return_value=llm):
         repaired = pick_team_demo("CSK vs MI")
     assert not validate_team(repaired)[0]
@@ -319,6 +329,9 @@ def test_streamlit_success_and_safe_errors():
         assert len(app.table[0].value) == 11
         assert "Credits" in app.table[0].value.columns
         assert len(app.metric) == 3
+        with patch("agent.pick_team_demo") as rerender_picker:
+            app.run()
+        rerender_picker.assert_not_called()
         request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
         errors = [
             AuthenticationError("sensitive", response=httpx.Response(401, request=request), body={}),
@@ -335,8 +348,73 @@ def test_streamlit_success_and_safe_errors():
             assert not app.table
 
 
+def test_incomplete_response_is_not_repaired_or_retried():
+    llm = Mock()
+    llm.invoke.return_value = AIMessage(content='{"players":[0,1', response_metadata={"finish_reason": "length"}, usage_metadata={"input_tokens": 800, "output_tokens": 2000, "total_tokens": 2800})
+    with patch("agent._make_demo_llm", return_value=llm), patch("agent.repair_team") as repair:
+        try:
+            pick_team_demo("CSK vs MI", verbose=True)
+        except ValueError as error:
+            assert "truncated" in str(error)
+        else:
+            raise AssertionError("Truncated output accepted")
+    llm.invoke.assert_called_once()
+    repair.assert_not_called()
+
+
+def test_invalid_ids_and_failed_repair_are_rejected():
+    payload = json.loads(_demo_json(_valid_sample()))
+    for bad in [-1, 999, True, "0"]:
+        invalid = dict(payload, players=[bad] + payload["players"][1:])
+        try:
+            agent._parse_demo_response(AIMessage(content=json.dumps(invalid), response_metadata={"finish_reason": "stop"}), "CSK vs MI")
+        except ValueError as error:
+            assert "invalid sample player IDs" in str(error)
+        else:
+            raise AssertionError("Noncanonical ID accepted")
+    payload["players"] = [0] * 11
+    llm = Mock()
+    llm.invoke.return_value = AIMessage(content=json.dumps(payload), response_metadata={"finish_reason": "stop"})
+    invalid_team = _make_team([next(iter(PLAYERS))] * 11)
+    with patch("agent._make_demo_llm", return_value=llm), patch("agent.repair_team", return_value=invalid_team):
+        try:
+            pick_team_demo("CSK vs MI")
+        except ValueError as error:
+            assert "Could not produce a valid XI" in str(error)
+        else:
+            raise AssertionError("Failed repair accepted")
+    llm.invoke.assert_called_once()
+
+
+def test_http_400_preserved_and_cli_formats_canonical_team():
+    import httpx
+    import run
+    from groq import BadRequestError
+    from contextlib import redirect_stdout
+    from io import StringIO
+    error = BadRequestError("bad output", response=httpx.Response(400, request=httpx.Request("POST", "https://api.groq.com")), body={"error": {"code": "output_parse_failed"}})
+    llm = Mock()
+    llm.invoke.side_effect = error
+    with patch("agent._make_demo_llm", return_value=llm):
+        try:
+            pick_team_demo("CSK vs MI")
+        except BadRequestError as caught:
+            assert caught is error and caught.status_code == 400
+        else:
+            raise AssertionError("HTTP 400 hidden")
+    llm.invoke.assert_called_once()
+    output = StringIO()
+    with patch("run.pick_team", return_value=_valid_sample()) as picker, patch("sys.argv", ["run.py", "CSK vs MI", "-q"]), redirect_stdout(output):
+        run.main()
+    picker.assert_called_once_with("CSK vs MI", verbose=False)
+    assert "Valid Dream11 XI" in output.getvalue() and "Credits:" in output.getvalue()
+
+
 if __name__ == "__main__":
     tests = [
+        test_incomplete_response_is_not_repaired_or_retried,
+        test_invalid_ids_and_failed_repair_are_rejected,
+        test_http_400_preserved_and_cli_formats_canonical_team,
         test_demo_json_parsing,
         test_demo_repairs_metadata_and_captaincy,
         test_demo_provider_error_never_retries,

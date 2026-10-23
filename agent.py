@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import json
-from pydantic import ValidationError
 from dotenv import load_dotenv, find_dotenv
 from groq import BadRequestError, GroqError
 from langchain_groq import ChatGroq
@@ -40,13 +39,12 @@ truststore.inject_into_ssl()
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_PARSE_ATTEMPTS = 1
 
-DEMO_SYSTEM = """You select a fantasy cricket XI from supplied SAMPLE data.
-Return ONLY one JSON object, without markdown or commentary, with keys match, captain, vice_captain, players, strategy.
-players must be an array of objects with player, team, role, reason string keys.
-Use only listed players and copy the supplied team/role values exactly.
-Obey: 11 unique players; WK 1-4, BAT 3-6, AR 1-4, BOWL 3-6;
-at most 100 credits; at most 7 players per real team; captain and vice-captain
-must be different members of the XI. Keep each reason to one short sentence."""
+DEMO_SYSTEM = """Select a fantasy cricket XI using only the supplied SAMPLE data.
+Return ONLY JSON: {"players":[0,1,2],"captain":0,"vice_captain":1,"strategy":"Short grounded strategy"}.
+Use exactly 11 unique integer player IDs from the supplied pool; the example is abbreviated.
+Captain and vice-captain must be distinct selected IDs. Strategy: at most 25 words.
+Do not repeat player names, attributes, or reasons: Python supplies them from sample data.
+Rules: WK 1-4, BAT 3-6, AR 1-4, BOWL 3-6; credits <=100; max 7 per team."""
 
 SYSTEM = """You are Dream11 Genie, an expert fantasy cricket analyst.
 
@@ -272,7 +270,7 @@ def _demo_prompt(match: str) -> str:
         for name in fixture["teams"][team_code]:
             player = PLAYERS[name]
             player_lines.append(
-                f"{name}|{team_code}|{player['role']}|{player['credits']}cr|"
+                f"{len(player_lines)}|{team_code}|{player['role']}|{player['credits']}cr|"
                 f"avg fantasy {player['avg_fantasy_points']}|{player['note']}"
             )
 
@@ -280,15 +278,18 @@ def _demo_prompt(match: str) -> str:
         f"Fixture: {match}\nVenue: {fixture['venue']}\n"
         f"Pitch: {pitch['surface']}; {pitch['pace_vs_spin']}\n"
         f"Sample form: {' | '.join(f'{code}: {search_form(code)}' for code in teams)}\n"
-        "Sample player data (name|team|role|credits|summary):\n"
+        "Sample player data (id|team|role|credits|summary):\n"
         + "\n".join(player_lines)
     )
 
 
-def _parse_demo_response(response) -> Team:
-    """Parse plain JSON locally; never retry or replace unusable AI output."""
-    if response.response_metadata.get("finish_reason") != "stop":
-        raise ValueError("Groq returned an incomplete response. No retry was attempted.")
+def _parse_demo_response(response, match: str) -> Team:
+    """Reject incomplete output; map fixture-local IDs to canonical sample data."""
+    finish = response.response_metadata.get("finish_reason")
+    if finish == "length":
+        raise ValueError("Groq output was truncated (finish_reason=length). No retry was attempted.")
+    if finish != "stop":
+        raise ValueError("Groq response did not finish normally. No retry was attempted.")
     content = response.content
     if not isinstance(content, str) or not content.strip():
         raise ValueError("Groq returned an empty response. No retry was attempted.")
@@ -298,12 +299,27 @@ def _parse_demo_response(response) -> Team:
     elif content.startswith("```") and content.endswith("```"):
         content = content[3:-3].strip()
     try:
-        team = Team.model_validate(json.loads(content))
-    except (ValueError, ValidationError) as error:
-        raise ValueError("Groq returned malformed JSON or missing team fields. No retry was attempted.") from error
-    if not team.players or not any(p.player in PLAYERS for p in team.players):
-        raise ValueError("Groq returned no usable sample players. No retry was attempted.")
-    return team
+        payload = json.loads(content)
+    except ValueError as error:
+        raise ValueError("Groq returned malformed JSON. No retry was attempted.") from error
+    pool = [name for squad in SQUADS[match]["teams"].values() for name in squad]
+    if not isinstance(payload, dict) or not {"players", "captain", "vice_captain", "strategy"} <= payload.keys():
+        raise ValueError("Groq JSON is missing required fields. No retry was attempted.")
+    ids = payload["players"]
+    if not isinstance(ids, list) or len(ids) != 11:
+        raise ValueError("Groq must return exactly 11 player IDs. No retry was attempted.")
+    if any(type(i) is not int or not 0 <= i < len(pool) for i in ids + [payload["captain"], payload["vice_captain"]]):
+        raise ValueError("Groq returned invalid sample player IDs. No retry was attempted.")
+    if not isinstance(payload["strategy"], str) or not payload["strategy"].strip():
+        raise ValueError("Groq returned no strategy. No retry was attempted.")
+    return Team.model_validate({
+        "match": match,
+        "captain": pool[payload["captain"]],
+        "vice_captain": pool[payload["vice_captain"]],
+        "players": [{"player": pool[i], "team": PLAYERS[pool[i]]["team"],
+                     "role": PLAYERS[pool[i]]["role"], "reason": PLAYERS[pool[i]]["note"]} for i in ids],
+        "strategy": payload["strategy"],
+    })
 
 
 def pick_team_demo(match: str, *, verbose: bool = False) -> Team:
@@ -317,8 +333,15 @@ def pick_team_demo(match: str, *, verbose: bool = False) -> Team:
     response = _make_demo_llm().invoke(
         [("system", DEMO_SYSTEM), ("user", prompt)]
     )
-    team = _parse_demo_response(response)
-    team = team.model_copy(update={"match": match})
+    if verbose:
+        # Numeric metadata only: never log response text, prompts, or credentials.
+        usage = response.usage_metadata or {}
+        finish = response.response_metadata.get("finish_reason")
+        safe_finish = finish if finish in {"stop", "length", "content_filter", "tool_calls"} else "other_or_missing"
+        print("[demo] finish_reason=" + safe_finish,
+              {key: value for key, value in usage.items()
+               if key in {"input_tokens", "output_tokens", "total_tokens"} and type(value) is int})
+    team = _parse_demo_response(response, match)
     issues, _ = validate_team(team)
     if issues:
         if verbose:
