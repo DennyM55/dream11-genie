@@ -13,8 +13,10 @@ from __future__ import annotations
 import os
 
 from dotenv import load_dotenv, find_dotenv
+from groq import BadRequestError
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
+from langchain_core.callbacks import BaseCallbackHandler
 
 from schema import Team
 from tools import TOOLS
@@ -28,6 +30,7 @@ load_dotenv(find_dotenv(usecwd=True))
 # tool-use model. Override via GROQ_MODEL (e.g. "openai/gpt-oss-20b" for speed).
 # Needs GROQ_API_KEY in the environment — get a free key at https://console.groq.com/keys
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+MAX_PARSE_ATTEMPTS = 2
 
 SYSTEM = """You are Dream11 Genie, an expert fantasy cricket analyst.
 
@@ -61,37 +64,140 @@ SELECTION PHILOSOPHY:
 Be decisive. Use the tools, reason, then commit to a team."""
 
 
+def _make_llm() -> ChatGroq:
+    """Build a Groq model with settings supported by GPT-OSS tool use."""
+    return ChatGroq(
+        model=MODEL,
+        temperature=0,
+        reasoning_format="hidden",
+        max_tokens=4096,
+        model_kwargs={"parallel_tool_calls": False},
+    )
+
+
+def _groq_error_detail(error: BaseException) -> str:
+    """Return safe provider error metadata without request headers or secrets."""
+    body = getattr(error, "body", None)
+    details = body.get("error", {}) if isinstance(body, dict) else {}
+    code = details.get("code") or "unknown"
+    error_type = details.get("type") or type(error).__name__
+    message = details.get("message") or str(error)
+    return f"code={code}, type={error_type}, message={message}"
+
+
+def _is_parse_failure(error: BaseException) -> bool:
+    if not isinstance(error, BadRequestError):
+        return False
+    body = getattr(error, "body", None)
+    details = body.get("error", {}) if isinstance(body, dict) else {}
+    return details.get("code") == "output_parse_failed"
+
+
+class _SafeTraceHandler(BaseCallbackHandler):
+    """Print stages and tool names only; never prompts, results, or headers."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        self.model_turn = 0
+        self.tool_names = {}
+
+    def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
+        self.model_turn += 1
+        print(f"   [{self.stage}] model turn {self.model_turn} started")
+
+    def on_llm_end(self, response, *, run_id, **kwargs):
+        message = response.generations[0][0].message
+        tool_names = [call.get("name", "unknown") for call in message.tool_calls]
+        finish = message.response_metadata.get("finish_reason", "unknown")
+        print(f"   [{self.stage}] model turn completed: finish={finish}, tools={tool_names}")
+
+    def on_llm_error(self, error, *, run_id, **kwargs):
+        print(f"   [{self.stage}] model turn failed: {_groq_error_detail(error)}")
+
+    def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
+        name = serialized.get("name", "unknown")
+        self.tool_names[run_id] = name
+        print(f"   [{self.stage}] tool started: {name}")
+
+    def on_tool_end(self, output, *, run_id, **kwargs):
+        print(f"   [{self.stage}] tool completed: {self.tool_names.pop(run_id, 'unknown')}")
+
+    def on_tool_error(self, error, *, run_id, **kwargs):
+        name = self.tool_names.pop(run_id, "unknown")
+        print(f"   [{self.stage}] tool failed: {name} ({type(error).__name__})")
+
+
 def _make_agent():
     """Build a fresh agent instance (cheap — no network call until invoke)."""
-    llm = ChatGroq(model=MODEL, temperature=0)
     return create_agent(
-        model=llm,
+        model=_make_llm(),
         tools=TOOLS,
         system_prompt=SYSTEM,
     )
 
 
-def _structured_team(messages, instruction: str) -> Team:
+def _invoke_agent(agent, messages, stage: str, verbose: bool):
+    """Invoke a tool agent, retrying only Groq output parsing failures."""
+    for attempt in range(1, MAX_PARSE_ATTEMPTS + 1):
+        if verbose:
+            print(f"   [{stage}] attempt {attempt}/{MAX_PARSE_ATTEMPTS}")
+        config = {"callbacks": [_SafeTraceHandler(stage)]} if verbose else None
+        try:
+            return agent.invoke({"messages": messages}, config=config)
+        except BadRequestError as error:
+            if not _is_parse_failure(error) or attempt == MAX_PARSE_ATTEMPTS:
+                raise RuntimeError(
+                    f"Groq failed during {stage} after {attempt} attempt(s): "
+                    f"{_groq_error_detail(error)}"
+                ) from error
+            if verbose:
+                print(f"   [{stage}] recoverable parse failure; retrying")
+    raise RuntimeError(f"Groq failed during {stage}")
+
+
+def _structured_team(messages, instruction: str, stage: str, verbose: bool) -> Team:
     """Convert a completed tool conversation to a Pydantic Team."""
-    llm = ChatGroq(model=MODEL, temperature=0)
-    structured_llm = llm.with_structured_output(
+    structured_llm = _make_llm().with_structured_output(
         Team,
         method="json_schema",
         strict=True,
         include_raw=True,
     )
-    response = structured_llm.invoke(messages + [("user", instruction)])
-    team = response.get("parsed")
-    if team is None:
+    for attempt in range(1, MAX_PARSE_ATTEMPTS + 1):
+        if verbose:
+            print(f"   [{stage}] attempt {attempt}/{MAX_PARSE_ATTEMPTS}")
+        try:
+            response = structured_llm.invoke(messages + [("user", instruction)])
+        except BadRequestError as error:
+            if not _is_parse_failure(error) or attempt == MAX_PARSE_ATTEMPTS:
+                raise RuntimeError(
+                    f"Groq failed during {stage} after {attempt} attempt(s): "
+                    f"{_groq_error_detail(error)}"
+                ) from error
+            if verbose:
+                print(f"   [{stage}] recoverable parse failure; retrying")
+            continue
+
+        team = response.get("parsed")
+        if team is not None:
+            if verbose:
+                print(f"   [{stage}] structured Team completed")
+            return team
+
         raw = response.get("raw")
         finish_reason = getattr(raw, "response_metadata", {}).get("finish_reason")
         parsing_error = response.get("parsing_error")
-        detail = f"; parsing error: {parsing_error}" if parsing_error else ""
-        raise RuntimeError(
-            "Groq completed the request but did not return a structured Team "
-            f"(finish reason: {finish_reason or 'unknown'}){detail}"
-        )
-    return team
+        if attempt == MAX_PARSE_ATTEMPTS:
+            detail = f"; parsing error: {parsing_error}" if parsing_error else ""
+            raise RuntimeError(
+                f"Groq did not return a structured Team during {stage} after "
+                f"{attempt} attempt(s) (finish reason: {finish_reason or 'unknown'})"
+                f"{detail}"
+            )
+        if verbose:
+            print(f"   [{stage}] missing structured Team; retrying")
+
+    raise RuntimeError(f"Groq failed during {stage}")
 
 
 def _format_issues(issues: list[str]) -> str:
@@ -114,15 +220,20 @@ def pick_team(match: str, *, verbose: bool = False) -> Team:
         print("=" * 55)
 
     # --- Pass 1: agent picks a team ----------------------------------------
-    result = agent.invoke({
-        "messages": [("user", f"Pick the best Dream11 fantasy XI for {match}. "
-                      "Use all your tools, follow the hard rules, and explain every pick.")]
-    })
+    result = _invoke_agent(
+        agent,
+        [("user", f"Pick the best Dream11 fantasy XI for {match}. "
+          "Use all your tools, follow the hard rules, and explain every pick.")],
+        "tool gathering",
+        verbose,
+    )
 
     team = _structured_team(
         result["messages"],
         "Return your final XI now as a Team matching the required schema. "
         "Use only the cricket evidence already gathered above.",
+        "structured team generation",
+        verbose,
     )
     issues, stats = validate_team(team)
 
@@ -152,14 +263,19 @@ def pick_team(match: str, *, verbose: bool = False) -> Team:
 
     # Continue the SAME conversation so the agent retains its tool observations.
     # We append the correction to the existing messages, not start from scratch.
-    corrected = agent.invoke({
-        "messages": result["messages"] + [("user", correction)]
-    })
+    corrected = _invoke_agent(
+        agent,
+        result["messages"] + [("user", correction)],
+        "correction tool gathering",
+        verbose,
+    )
 
     team = _structured_team(
         corrected["messages"],
         "Return the corrected XI now as a Team matching the required schema. "
         "Fix every validation violation listed above.",
+        "corrected structured team generation",
+        verbose,
     )
     issues, stats = validate_team(team)
 
