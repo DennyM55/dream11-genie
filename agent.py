@@ -15,7 +15,6 @@ import os
 from dotenv import load_dotenv, find_dotenv
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
-from langchain.agents.structured_output import ToolStrategy
 
 from schema import Team
 from tools import TOOLS
@@ -69,8 +68,30 @@ def _make_agent():
         model=llm,
         tools=TOOLS,
         system_prompt=SYSTEM,
-        response_format=ToolStrategy(Team),
     )
+
+
+def _structured_team(messages, instruction: str) -> Team:
+    """Convert a completed tool conversation to a Pydantic Team."""
+    llm = ChatGroq(model=MODEL, temperature=0)
+    structured_llm = llm.with_structured_output(
+        Team,
+        method="json_schema",
+        strict=True,
+        include_raw=True,
+    )
+    response = structured_llm.invoke(messages + [("user", instruction)])
+    team = response.get("parsed")
+    if team is None:
+        raw = response.get("raw")
+        finish_reason = getattr(raw, "response_metadata", {}).get("finish_reason")
+        parsing_error = response.get("parsing_error")
+        detail = f"; parsing error: {parsing_error}" if parsing_error else ""
+        raise RuntimeError(
+            "Groq completed the request but did not return a structured Team "
+            f"(finish reason: {finish_reason or 'unknown'}){detail}"
+        )
+    return team
 
 
 def _format_issues(issues: list[str]) -> str:
@@ -98,7 +119,11 @@ def pick_team(match: str, *, verbose: bool = False) -> Team:
                       "Use all your tools, follow the hard rules, and explain every pick.")]
     })
 
-    team: Team = result["structured_response"]
+    team = _structured_team(
+        result["messages"],
+        "Return your final XI now as a Team matching the required schema. "
+        "Use only the cricket evidence already gathered above.",
+    )
     issues, stats = validate_team(team)
 
     if verbose:
@@ -131,7 +156,11 @@ def pick_team(match: str, *, verbose: bool = False) -> Team:
         "messages": result["messages"] + [("user", correction)]
     })
 
-    team = corrected["structured_response"]
+    team = _structured_team(
+        corrected["messages"],
+        "Return the corrected XI now as a Team matching the required schema. "
+        "Fix every validation violation listed above.",
+    )
     issues, stats = validate_team(team)
 
     if verbose:
