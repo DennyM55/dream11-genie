@@ -28,3 +28,23 @@ def get_pitch_report():
     return "Spin-friendly pitch"
 
 print(get_pitch_report())
+
+pitch_tool_schema = {
+    "type": "function",
+    "function": {
+        "name": "get_pitch_report",
+        "description": "Get sample pitch conditions",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+}
+
+tools = [
+    tool_schema,
+    pitch_tool_schema
+]
+
+print(len(tools))
