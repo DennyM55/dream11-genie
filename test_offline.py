@@ -10,7 +10,7 @@ import ssl
 from unittest.mock import patch
 
 import agent
-from agent import _make_llm
+from agent import _make_llm, pick_team_demo, rate_limit_message
 from data import PLAYERS, SQUADS
 from schema import Pick, Team
 from tools import get_match_squads, get_player_stats, search_form, get_pitch_report
@@ -57,6 +57,50 @@ def test_groq_client_safety_settings():
     assert llm.request_timeout == 60
     assert llm.max_retries == 0
     assert llm.model_kwargs["parallel_tool_calls"] is False
+
+
+def test_demo_uses_one_request_and_repairs_locally():
+    names = [
+        "MS Dhoni", "Ruturaj Gaikwad", "Devon Conway", "Ajinkya Rahane",
+        "Shivam Dube", "Ravindra Jadeja", "Deepak Chahar",
+        "Matheesha Pathirana", "Maheesh Theekshana", "Tushar Deshpande",
+        "Jasprit Bumrah",
+    ]
+    invalid_team = _make_team(names)
+    class Structured:
+        calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            return invalid_team
+
+    structured = Structured()
+    llm = type(
+        "FakeLLM",
+        (),
+        {"with_structured_output": lambda self, *args, **kwargs: structured},
+    )()
+
+    with patch("agent._make_demo_llm", return_value=llm) as make_llm:
+        repaired = pick_team_demo("CSK vs MI")
+
+    make_llm.assert_called_once_with()
+    assert structured.calls == 1
+    issues, meta = validate_team(repaired)
+    assert not issues
+    assert meta["teams"] == {"CSK": 7, "MI": 4}
+
+
+def test_rate_limit_messages_use_provider_error_details():
+    class ProviderError(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.body = {"error": {"code": "rate_limit_exceeded", "message": message}}
+
+    assert "per-minute token" in rate_limit_message(ProviderError("tokens per minute (TPM)"))
+    assert "daily token" in rate_limit_message(ProviderError("tokens per day (TPD)"))
+    assert "request-rate" in rate_limit_message(ProviderError("requests per minute (RPM)"))
+    assert "daily request" in rate_limit_message(ProviderError("requests per day (RPD)"))
 
 
 def test_valid_team():
@@ -204,6 +248,8 @@ if __name__ == "__main__":
     tests = [
         test_tools,
         test_groq_client_safety_settings,
+        test_demo_uses_one_request_and_repairs_locally,
+        test_rate_limit_messages_use_provider_error_details,
         test_valid_team,
         test_duplicate_player,
         test_over_budget,

@@ -18,8 +18,9 @@ from langchain.agents import create_agent
 from langchain_core.callbacks import BaseCallbackHandler
 import truststore
 
+from data import PLAYERS, SQUADS
 from schema import Team
-from tools import TOOLS
+from tools import TOOLS, get_pitch_report, search_form
 from validate import validate_team, player_pool_text, repair_credits, repair_team
 
 # Find a .env by walking up from the current directory (so it works whether the
@@ -36,6 +37,14 @@ truststore.inject_into_ssl()
 # Needs GROQ_API_KEY in the environment — get a free key at https://console.groq.com/keys
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_PARSE_ATTEMPTS = 2
+
+DEMO_SYSTEM = """You select a fantasy cricket XI from supplied SAMPLE data.
+Return one JSON object with keys match, captain, vice_captain, players, strategy.
+players must be an array of objects with player, team, role, reason string keys.
+Use only listed players and copy the supplied team/role values exactly.
+Obey: 11 unique players; WK 1-4, BAT 3-6, AR 1-4, BOWL 3-6;
+at most 100 credits; at most 7 players per real team; captain and vice-captain
+must be different members of the XI. Keep each reason to one short sentence."""
 
 SYSTEM = """You are Dream11 Genie, an expert fantasy cricket analyst.
 
@@ -80,6 +89,39 @@ def _make_llm() -> ChatGroq:
         max_retries=0,
         model_kwargs={"parallel_tool_calls": False},
     )
+
+
+def _make_demo_llm() -> ChatGroq:
+    """Build the no-retry model used for the single-request demo path."""
+    return ChatGroq(
+        model=MODEL,
+        temperature=0,
+        reasoning_format="hidden",
+        max_tokens=2500,
+        timeout=60,
+        max_retries=0,
+    )
+
+
+def rate_limit_message(error: BaseException) -> str:
+    """Turn Groq's actual 429 details into a useful, non-retrying UI message."""
+    body = getattr(error, "body", None)
+    details = body.get("error", {}) if isinstance(body, dict) else {}
+    raw = " ".join(
+        str(value)
+        for value in (details.get("code"), details.get("type"), details.get("message"), error)
+        if value
+    ).lower()
+
+    if "tokens per day" in raw or "tpd" in raw or "daily token" in raw:
+        return "Groq's daily token quota is exhausted. It will reset later; no retry was attempted."
+    if "tokens per minute" in raw or "tpm" in raw:
+        return "Groq's per-minute token limit was reached. Wait for the limit window to reset; no retry was attempted."
+    if "requests per day" in raw or "rpd" in raw or "daily request" in raw:
+        return "Groq's daily request quota is exhausted. It will reset later; no retry was attempted."
+    if "requests per minute" in raw or "rpm" in raw or "request limit" in raw:
+        return "Groq's request-rate limit was reached. Wait for the limit window to reset; no retry was attempted."
+    return "Groq returned a rate-limit error. Check the provider limit details; no retry was attempted."
 
 
 def _groq_error_detail(error: BaseException) -> str:
@@ -213,6 +255,60 @@ def _structured_team(messages, instruction: str, stage: str, verbose: bool) -> T
 
 def _format_issues(issues: list[str]) -> str:
     return "\n".join(f"- {issue}" for issue in issues)
+
+
+def _demo_prompt(match: str) -> str:
+    """Build compact local evidence for the one-request demo mode."""
+    fixture = SQUADS.get(match)
+    if fixture is None:
+        raise ValueError(f"No sample data is available for {match}")
+
+    pitch = get_pitch_report(fixture["venue"])
+    teams = list(fixture["teams"])
+    player_lines = []
+    for team_code in teams:
+        for name in fixture["teams"][team_code]:
+            player = PLAYERS[name]
+            player_lines.append(
+                f"{name}|{team_code}|{player['role']}|{player['credits']}cr|"
+                f"avg fantasy {player['avg_fantasy_points']}|{player['note']}"
+            )
+
+    return (
+        f"Fixture: {match}\nVenue: {fixture['venue']}\n"
+        f"Pitch: {pitch['surface']}; {pitch['pace_vs_spin']}\n"
+        f"Sample form: {' | '.join(f'{code}: {search_form(code)}' for code in teams)}\n"
+        "Sample player data (name|team|role|credits|summary):\n"
+        + "\n".join(player_lines)
+    )
+
+
+def pick_team_demo(match: str, *, verbose: bool = False) -> Team:
+    """Generate and locally validate a Team with exactly one Groq request.
+
+    Local sample tools are called directly before the request. Any rule-invalid
+    Team is repaired deterministically; provider and parsing failures are not
+    retried.
+    """
+    structured_llm = _make_demo_llm().with_structured_output(
+        Team,
+        method="json_mode",
+    )
+    if verbose:
+        print(f"[demo] one structured Groq request | {match} | model={MODEL}")
+    team = structured_llm.invoke(
+        [("system", DEMO_SYSTEM), ("user", _demo_prompt(match))]
+    )
+    team = team.model_copy(update={"match": match})
+    issues, _ = validate_team(team)
+    if issues:
+        if verbose:
+            print(f"[demo] repairing {len(issues)} validation issue(s) locally")
+        team = repair_team(team)
+    final_issues, _ = validate_team(team)
+    if final_issues:
+        raise ValueError("Could not produce a valid XI:\n" + _format_issues(final_issues))
+    return team
 
 
 def pick_team(match: str, *, verbose: bool = False) -> Team:
