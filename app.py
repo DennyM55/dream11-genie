@@ -1,4 +1,5 @@
 import streamlit as st
+from groq import APITimeoutError, AuthenticationError, RateLimitError
 
 from agent import pick_team
 from data import SQUADS
@@ -6,13 +7,19 @@ from data import SQUADS
 
 def _pick_team_safely(match):
     try:
-        return pick_team(match)
-    except Exception:
-        st.error(
-            "Dream11 Genie could not build a valid team right now. "
-            "Please try again in a moment."
-        )
-        return None
+        return pick_team(match, verbose=True)
+    except AuthenticationError:
+        st.error("The Groq API key is invalid or missing.")
+    except RateLimitError:
+        st.error("The Groq token limit has been reached. Please try again later.")
+    except APITimeoutError:
+        st.error("Groq took too long to respond. Please try again.")
+    except ValueError:
+        st.error("The generated team could not satisfy all Dream11 rules.")
+    except Exception as error:
+        print(f"[streamlit] team generation failed: {type(error).__name__}")
+        st.error("Groq returned an invalid response. Please try again.")
+    return None
 
 
 st.set_page_config(page_title="Dream11 Genie", page_icon="🏏", layout="centered")

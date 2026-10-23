@@ -11,12 +11,12 @@ Needs a free Groq API key in the environment as GROQ_API_KEY (see .env.example).
 from __future__ import annotations
 
 import os
-
 from dotenv import load_dotenv, find_dotenv
-from groq import BadRequestError
+from groq import BadRequestError, GroqError
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
 from langchain_core.callbacks import BaseCallbackHandler
+import truststore
 
 from schema import Team
 from tools import TOOLS
@@ -25,6 +25,11 @@ from validate import validate_team, player_pool_text, repair_credits, repair_tea
 # Find a .env by walking up from the current directory (so it works whether the
 # key sits in this project folder or a parent course folder).
 load_dotenv(find_dotenv(usecwd=True))
+
+# Use the operating system's trusted certificate store. This keeps TLS
+# verification enabled while supporting local Windows networks whose trusted
+# root certificate is not included in Python's bundled CA file.
+truststore.inject_into_ssl()
 
 # Groq (free tier) with LangGraph. openai/gpt-oss-120b is Groq's flagship
 # tool-use model. Override via GROQ_MODEL (e.g. "openai/gpt-oss-20b" for speed).
@@ -41,7 +46,7 @@ WORKFLOW — follow these steps IN ORDER:
 1. Call get_match_squads to learn the available players and venue.
 2. Call get_pitch_report for that venue.
 3. Call search_form for BOTH teams.
-4. Call get_player_stats for at least 8-10 key players (preferably all 11+).
+4. Call get_player_stats for 2-3 key captaincy candidates.
 5. Reason about form, pitch fit, role balance and fantasy points.
 6. Output your final XI.
 
@@ -71,6 +76,8 @@ def _make_llm() -> ChatGroq:
         temperature=0,
         reasoning_format="hidden",
         max_tokens=4096,
+        timeout=60,
+        max_retries=0,
         model_kwargs={"parallel_tool_calls": False},
     )
 
@@ -90,7 +97,11 @@ def _is_parse_failure(error: BaseException) -> bool:
         return False
     body = getattr(error, "body", None)
     details = body.get("error", {}) if isinstance(body, dict) else {}
-    return details.get("code") in {"output_parse_failed", "json_validate_failed"}
+    return details.get("code") in {
+        "output_parse_failed",
+        "json_validate_failed",
+        "tool_use_failed",
+    }
 
 
 class _SafeTraceHandler(BaseCallbackHandler):
@@ -263,27 +274,34 @@ def pick_team(match: str, *, verbose: bool = False) -> Team:
 
     # Continue the SAME conversation so the agent retains its tool observations.
     # We append the correction to the existing messages, not start from scratch.
-    corrected = _invoke_agent(
-        agent,
-        result["messages"] + [("user", correction)],
-        "correction tool gathering",
-        verbose,
-    )
+    try:
+        corrected = _invoke_agent(
+            agent,
+            result["messages"] + [("user", correction)],
+            "correction tool gathering",
+            verbose,
+        )
 
-    team = _structured_team(
-        corrected["messages"],
-        "Return the corrected XI now as a Team matching the required schema. "
-        "Fix every validation violation listed above.",
-        "corrected structured team generation",
-        verbose,
-    )
-    issues, stats = validate_team(team)
+        team = _structured_team(
+            corrected["messages"],
+            "Return the corrected XI now as a Team matching the required schema. "
+            "Fix every validation violation listed above.",
+            "corrected structured team generation",
+            verbose,
+        )
+        issues, stats = validate_team(team)
 
-    if verbose:
-        print(f"\n📋 Corrected draft: {len(team.players)} players | "
-              f"{stats['credits']} credits | issues={len(issues)}")
-        for issue in issues:
-            print(f"   ⚠ {issue}")
+        if verbose:
+            print(f"\n📋 Corrected draft: {len(team.players)} players | "
+                  f"{stats['credits']} credits | issues={len(issues)}")
+            for issue in issues:
+                print(f"   ⚠ {issue}")
+    except (GroqError, RuntimeError) as error:
+        if verbose:
+            print(
+                "   [correction] provider correction unavailable; "
+                f"using deterministic repair ({type(error).__name__})"
+            )
 
     if not issues:
         return team

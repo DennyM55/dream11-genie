@@ -6,6 +6,11 @@ No Groq key or network access required.
 """
 from __future__ import annotations
 
+import ssl
+from unittest.mock import patch
+
+import agent
+from agent import _make_llm
 from data import PLAYERS, SQUADS
 from schema import Pick, Team
 from tools import get_match_squads, get_player_stats, search_form, get_pitch_report
@@ -44,6 +49,14 @@ def test_tools():
 
     assert isinstance(search_form("CSK"), str)
     assert "surface" in get_pitch_report("Chepauk")
+
+
+def test_groq_client_safety_settings():
+    llm = _make_llm()
+    assert ssl.SSLContext.__module__ == "truststore._api"
+    assert llm.request_timeout == 60
+    assert llm.max_retries == 0
+    assert llm.model_kwargs["parallel_tool_calls"] is False
 
 
 def test_valid_team():
@@ -151,6 +164,30 @@ def test_repair_ten_players_from_one_team():
     assert repaired.captain != repaired.vice_captain
 
 
+def test_correction_provider_failure_uses_deterministic_repair():
+    names = [
+        "MS Dhoni", "Ruturaj Gaikwad", "Devon Conway", "Ajinkya Rahane",
+        "Shivam Dube", "Ravindra Jadeja", "Deepak Chahar",
+        "Matheesha Pathirana", "Maheesh Theekshana", "Tushar Deshpande",
+        "Jasprit Bumrah",
+    ]
+    invalid_team = _make_team(names)
+
+    with (
+        patch("agent._make_agent", return_value=object()),
+        patch(
+            "agent._invoke_agent",
+            side_effect=[{"messages": []}, RuntimeError("provider unavailable")],
+        ),
+        patch("agent._structured_team", return_value=invalid_team),
+    ):
+        repaired = agent.pick_team("CSK vs MI")
+
+    issues, meta = validate_team(repaired)
+    assert not issues
+    assert meta["teams"] == {"CSK": 7, "MI": 4}
+
+
 def test_captain_not_in_xi():
     names = [
         "MS Dhoni", "Ruturaj Gaikwad", "Devon Conway",
@@ -166,12 +203,14 @@ def test_captain_not_in_xi():
 if __name__ == "__main__":
     tests = [
         test_tools,
+        test_groq_client_safety_settings,
         test_valid_team,
         test_duplicate_player,
         test_over_budget,
         test_wrong_roles,
         test_team_cap,
         test_repair_ten_players_from_one_team,
+        test_correction_provider_failure_uses_deterministic_repair,
         test_captain_not_in_xi,
     ]
     for test in tests:
