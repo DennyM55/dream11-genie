@@ -3,6 +3,18 @@ import streamlit as st
 from agent import pick_team
 from data import SQUADS
 
+
+def _pick_team_safely(match):
+    try:
+        return pick_team(match)
+    except Exception:
+        st.error(
+            "Dream11 Genie could not build a valid team right now. "
+            "Please try again in a moment."
+        )
+        return None
+
+
 st.set_page_config(page_title="Dream11 Genie", page_icon="🏏", layout="centered")
 
 st.title("🏏 Dream11 Genie")
@@ -12,7 +24,10 @@ match = st.selectbox("Pick a fixture", list(SQUADS.keys()))
 
 if st.button("Generate my XI", type="primary"):
     with st.spinner("The agent is calling tools and reasoning…"):
-        team = pick_team(match)
+        team = _pick_team_safely(match)
+
+    if team is None:
+        st.stop()
 
     st.subheader(f"Your XI — {team.match}")
     c1, c2 = st.columns(2)

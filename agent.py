@@ -20,7 +20,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 from schema import Team
 from tools import TOOLS
-from validate import validate_team, player_pool_text, repair_credits
+from validate import validate_team, player_pool_text, repair_credits, repair_team
 
 # Find a .env by walking up from the current directory (so it works whether the
 # key sits in this project folder or a parent course folder).
@@ -90,7 +90,7 @@ def _is_parse_failure(error: BaseException) -> bool:
         return False
     body = getattr(error, "body", None)
     details = body.get("error", {}) if isinstance(body, dict) else {}
-    return details.get("code") == "output_parse_failed"
+    return details.get("code") in {"output_parse_failed", "json_validate_failed"}
 
 
 class _SafeTraceHandler(BaseCallbackHandler):
@@ -288,7 +288,7 @@ def pick_team(match: str, *, verbose: bool = False) -> Team:
     if not issues:
         return team
 
-    # --- Pass 3: deterministic credit repair -------------------------------
+    # --- Pass 3: deterministic rule repair ---------------------------------
     # Numeric constraints are better enforced in code than left to the LLM.
     if any("credits" in issue for issue in issues):
         if verbose:
@@ -301,6 +301,21 @@ def pick_team(match: str, *, verbose: bool = False) -> Team:
                   f"issues={len(issues)}")
             for issue in issues:
                 print(f"   ⚠ {issue}")
+
+    if issues:
+        if verbose:
+            print("\nRunning deterministic full-team repair...")
+        try:
+            team = repair_team(team)
+        except ValueError as error:
+            raise ValueError(
+                f"Could not produce a valid XI for {match}: {error}"
+            ) from error
+        issues, stats = validate_team(team)
+
+        if verbose:
+            print(f"   After full repair: {stats['credits']} credits | "
+                  f"issues={len(issues)}")
 
     if issues:
         raise ValueError(

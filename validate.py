@@ -8,8 +8,9 @@ feed any violations back for a single correction pass (see agent.pick_team).
 from __future__ import annotations
 
 from collections import Counter
+from itertools import combinations, product
 
-from data import PLAYERS
+from data import PLAYERS, SQUADS
 from schema import Pick, Team
 
 RULES = {
@@ -121,6 +122,110 @@ def repair_credits(team: Team) -> Team:
             picks.append(original[n])
     return Team(match=team.match, captain=team.captain, vice_captain=team.vice_captain,
                 players=picks, strategy=team.strategy)
+
+
+def repair_team(team: Team) -> Team:
+    """Rebuild an invalid XI from known squad players under every hard rule.
+
+    If the current XI has a valid role composition, that exact composition is
+    preserved. The best valid result keeps as many original players and
+    captaincy choices as possible, then favours average fantasy points.
+    """
+    fixture = SQUADS.get(team.match)
+    if not fixture:
+        raise ValueError(f"No squad data available to repair {team.match}")
+
+    pool_names = [
+        name
+        for squad in fixture["teams"].values()
+        for name in squad
+        if name in PLAYERS
+    ]
+    original_names = {pick.player for pick in team.players if pick.player in PLAYERS}
+    original_reasons = {pick.player: pick.reason for pick in team.players}
+    current_roles = Counter(PLAYERS[name]["role"] for name in original_names)
+    role_order = tuple(RULES["composition"])
+
+    if (
+        len(team.players) == RULES["size"]
+        and len(original_names) == RULES["size"]
+        and all(
+            low <= current_roles.get(role, 0) <= high
+            for role, (low, high) in RULES["composition"].items()
+        )
+    ):
+        target_roles = [tuple(current_roles[role] for role in role_order)]
+    else:
+        target_roles = [
+            counts
+            for counts in product(
+                *(range(low, high + 1) for low, high in RULES["composition"].values())
+            )
+            if sum(counts) == RULES["size"]
+        ]
+
+    by_role = {
+        role: [name for name in pool_names if PLAYERS[name]["role"] == role]
+        for role in role_order
+    }
+    best = None
+
+    def search(target, role_index, selected, credits, team_counts):
+        nonlocal best
+        if role_index == len(role_order):
+            names = tuple(selected)
+            captaincy_kept = int(team.captain in names) + int(team.vice_captain in names)
+            retained = len(original_names.intersection(names))
+            fantasy_points = sum(PLAYERS[name]["avg_fantasy_points"] for name in names)
+            score = (captaincy_kept, retained, fantasy_points, -credits)
+            if best is None or score > best[0]:
+                best = (score, names)
+            return
+
+        role = role_order[role_index]
+        count = target[role_index]
+        for role_picks in combinations(by_role[role], count):
+            next_credits = credits + sum(PLAYERS[name]["credits"] for name in role_picks)
+            if next_credits > RULES["max_credits"]:
+                continue
+            next_teams = team_counts.copy()
+            next_teams.update(PLAYERS[name]["team"] for name in role_picks)
+            if any(value > RULES["max_per_team"] for value in next_teams.values()):
+                continue
+            search(target, role_index + 1, selected + list(role_picks), next_credits, next_teams)
+
+    for target in target_roles:
+        search(target, 0, [], 0.0, Counter())
+
+    if best is None:
+        raise ValueError(f"No valid XI can be constructed from the squad for {team.match}")
+
+    names = list(best[1])
+    ranked = sorted(names, key=lambda name: PLAYERS[name]["avg_fantasy_points"], reverse=True)
+    captain = team.captain if team.captain in names else ranked[0]
+    vice_captain = team.vice_captain if team.vice_captain in names and team.vice_captain != captain else next(
+        name for name in ranked if name != captain
+    )
+    picks = [
+        Pick(
+            player=name,
+            team=PLAYERS[name]["team"],
+            role=PLAYERS[name]["role"],
+            reason=original_reasons.get(name, f"Rule repair selection — {PLAYERS[name]['note']}"),
+        )
+        for name in names
+    ]
+    repaired = Team(
+        match=team.match,
+        captain=captain,
+        vice_captain=vice_captain,
+        players=picks,
+        strategy=team.strategy,
+    )
+    issues, _ = validate_team(repaired)
+    if issues:
+        raise ValueError("Deterministic team repair failed validation: " + "; ".join(issues))
+    return repaired
 
 
 def player_pool_text(match: str | None = None) -> str:

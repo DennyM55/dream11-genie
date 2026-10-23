@@ -9,7 +9,7 @@ from __future__ import annotations
 from data import PLAYERS, SQUADS
 from schema import Pick, Team
 from tools import get_match_squads, get_player_stats, search_form, get_pitch_report
-from validate import validate_team, repair_credits
+from validate import validate_team, repair_credits, repair_team
 
 
 def _make_team(names, captain=None, vice_captain=None):
@@ -126,6 +126,31 @@ def test_team_cap():
     assert any("max 7" in issue for issue in issues)
 
 
+def test_repair_ten_players_from_one_team():
+    names = [
+        "MS Dhoni", "Ruturaj Gaikwad", "Devon Conway", "Ajinkya Rahane",
+        "Shivam Dube", "Ravindra Jadeja", "Deepak Chahar",
+        "Matheesha Pathirana", "Maheesh Theekshana", "Tushar Deshpande",
+        "Jasprit Bumrah",
+    ]
+    team = _make_team(names)
+    original_roles = validate_team(team)[1]["roles"]
+    issues, meta = validate_team(team)
+    assert meta["teams"]["CSK"] == 10
+    assert any("max 7" in issue for issue in issues)
+
+    repaired = repair_team(team)
+    new_issues, new_meta = validate_team(repaired)
+    assert not new_issues, f"Team-balance repair failed: {new_issues}"
+    assert new_meta["teams"] == {"CSK": 7, "MI": 4}
+    assert new_meta["roles"] == original_roles
+    assert new_meta["credits"] <= 100
+    assert len({pick.player for pick in repaired.players}) == 11
+    assert repaired.captain in {pick.player for pick in repaired.players}
+    assert repaired.vice_captain in {pick.player for pick in repaired.players}
+    assert repaired.captain != repaired.vice_captain
+
+
 def test_captain_not_in_xi():
     names = [
         "MS Dhoni", "Ruturaj Gaikwad", "Devon Conway",
@@ -146,6 +171,7 @@ if __name__ == "__main__":
         test_over_budget,
         test_wrong_roles,
         test_team_cap,
+        test_repair_ten_players_from_one_team,
         test_captain_not_in_xi,
     ]
     for test in tests:
