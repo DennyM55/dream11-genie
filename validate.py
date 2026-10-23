@@ -35,6 +35,19 @@ def validate_team(team) -> tuple[list[str], dict]:
     if len(set(names)) != len(names):
         issues.append("duplicate players in the XI")
 
+    fixture = SQUADS.get(team.match)
+    if fixture is None:
+        issues.append("unknown sample fixture")
+    else:
+        pool = {name for squad in fixture["teams"].values() for name in squad}
+        if any(name not in pool for name in names):
+            issues.append("players outside the selected fixture")
+    for pick in team.players:
+        if pick.player in PLAYERS:
+            data = PLAYERS[pick.player]
+            if pick.role != data["role"] or pick.team != data["team"]:
+                issues.append(f"incorrect role or team for {pick.player}")
+
     roles = Counter(PLAYERS[n]["role"] for n in known)
     for role, (lo, hi) in RULES["composition"].items():
         c = roles.get(role, 0)

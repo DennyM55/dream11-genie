@@ -1,22 +1,32 @@
+import os
 import streamlit as st
-from groq import APITimeoutError, AuthenticationError, RateLimitError
+from groq import APIConnectionError, APITimeoutError, AuthenticationError, RateLimitError
 
 from agent import pick_team, pick_team_demo, rate_limit_message
-from data import SQUADS
+from data import PLAYERS, SQUADS
+from validate import validate_team
 
 
 def _pick_team_safely(match, mode):
+    if not os.getenv("GROQ_API_KEY"):
+        st.error("The Groq API key is missing. Configure GROQ_API_KEY in deployment secrets.")
+        return None
     try:
         picker = pick_team_demo if mode == "Simple demo" else pick_team
-        return picker(match, verbose=True)
+        team = picker(match, verbose=False)
+        if validate_team(team)[0]:
+            raise ValueError("Invalid XI")
+        return team
     except AuthenticationError:
         st.error("The Groq API key is invalid or missing.")
     except RateLimitError as error:
         st.error(rate_limit_message(error))
     except APITimeoutError:
         st.error("Groq took too long to respond. No retry was attempted.")
+    except APIConnectionError:
+        st.error("Could not connect to Groq. No retry was attempted.")
     except ValueError:
-        st.error("The generated team could not satisfy all Dream11 rules.")
+        st.error("Groq returned malformed, incomplete, or invalid team data. No retry was attempted.")
     except Exception as error:
         print(f"[streamlit] team generation failed: {type(error).__name__}")
         st.error("Groq returned an invalid response. No automatic retry was attempted.")
@@ -58,6 +68,9 @@ if submitted:
     c1.metric("Captain (2x)", team.captain)
     c2.metric("Vice-captain (1.5x)", team.vice_captain)
 
+    _, stats = validate_team(team)
+    st.metric("Total credits (maximum 100)", stats["credits"])
+    st.caption("Roles: " + " · ".join(f"{role}: {count}" for role, count in stats["roles"].items()))
     st.table(
         [
             {
@@ -67,6 +80,7 @@ if submitted:
                 "Player": p.player,
                 "Role": p.role,
                 "Team": p.team,
+                "Credits": PLAYERS[p.player]["credits"],
                 "Why": p.reason,
             }
             for p in team.players

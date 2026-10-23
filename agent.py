@@ -11,6 +11,8 @@ Needs a free Groq API key in the environment as GROQ_API_KEY (see .env.example).
 from __future__ import annotations
 
 import os
+import json
+from pydantic import ValidationError
 from dotenv import load_dotenv, find_dotenv
 from groq import BadRequestError, GroqError
 from langchain_groq import ChatGroq
@@ -36,10 +38,10 @@ truststore.inject_into_ssl()
 # tool-use model. Override via GROQ_MODEL (e.g. "openai/gpt-oss-20b" for speed).
 # Needs GROQ_API_KEY in the environment — get a free key at https://console.groq.com/keys
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-MAX_PARSE_ATTEMPTS = 2
+MAX_PARSE_ATTEMPTS = 1
 
 DEMO_SYSTEM = """You select a fantasy cricket XI from supplied SAMPLE data.
-Return one JSON object with keys match, captain, vice_captain, players, strategy.
+Return ONLY one JSON object, without markdown or commentary, with keys match, captain, vice_captain, players, strategy.
 players must be an array of objects with player, team, role, reason string keys.
 Use only listed players and copy the supplied team/role values exactly.
 Obey: 11 unique players; WK 1-4, BAT 3-6, AR 1-4, BOWL 3-6;
@@ -94,10 +96,10 @@ def _make_llm() -> ChatGroq:
 def _make_demo_llm() -> ChatGroq:
     """Build the no-retry model used for the single-request demo path."""
     return ChatGroq(
-        model=MODEL,
+        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
         temperature=0,
         reasoning_format="hidden",
-        max_tokens=2500,
+        max_tokens=2000,
         timeout=60,
         max_retries=0,
     )
@@ -283,6 +285,27 @@ def _demo_prompt(match: str) -> str:
     )
 
 
+def _parse_demo_response(response) -> Team:
+    """Parse plain JSON locally; never retry or replace unusable AI output."""
+    if response.response_metadata.get("finish_reason") != "stop":
+        raise ValueError("Groq returned an incomplete response. No retry was attempted.")
+    content = response.content
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Groq returned an empty response. No retry was attempted.")
+    content = content.strip()
+    if content.startswith("```json") and content.endswith("```"):
+        content = content[7:-3].strip()
+    elif content.startswith("```") and content.endswith("```"):
+        content = content[3:-3].strip()
+    try:
+        team = Team.model_validate(json.loads(content))
+    except (ValueError, ValidationError) as error:
+        raise ValueError("Groq returned malformed JSON or missing team fields. No retry was attempted.") from error
+    if not team.players or not any(p.player in PLAYERS for p in team.players):
+        raise ValueError("Groq returned no usable sample players. No retry was attempted.")
+    return team
+
+
 def pick_team_demo(match: str, *, verbose: bool = False) -> Team:
     """Generate and locally validate a Team with exactly one Groq request.
 
@@ -290,15 +313,11 @@ def pick_team_demo(match: str, *, verbose: bool = False) -> Team:
     Team is repaired deterministically; provider and parsing failures are not
     retried.
     """
-    structured_llm = _make_demo_llm().with_structured_output(
-        Team,
-        method="json_mode",
+    prompt = _demo_prompt(match)  # Reject unknown fixtures before any API request.
+    response = _make_demo_llm().invoke(
+        [("system", DEMO_SYSTEM), ("user", prompt)]
     )
-    if verbose:
-        print(f"[demo] one structured Groq request | {match} | model={MODEL}")
-    team = structured_llm.invoke(
-        [("system", DEMO_SYSTEM), ("user", _demo_prompt(match))]
-    )
+    team = _parse_demo_response(response)
     team = team.model_copy(update={"match": match})
     issues, _ = validate_team(team)
     if issues:
