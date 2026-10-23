@@ -15,6 +15,7 @@ import os
 from dotenv import load_dotenv, find_dotenv
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
+from langchain.agents.structured_output import ToolStrategy
 
 from schema import Team
 from tools import TOOLS
@@ -68,7 +69,7 @@ def _make_agent():
         model=llm,
         tools=TOOLS,
         system_prompt=SYSTEM,
-        response_format=Team,
+        response_format=ToolStrategy(Team),
     )
 
 
