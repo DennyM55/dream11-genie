@@ -6,10 +6,10 @@ from agent import (
     GroqMalformedJSONError,
     GroqTruncatedOutputError,
     GroqValidationError,
-    pick_team,
     pick_team_demo,
     rate_limit_message,
 )
+from learning_graph import pick_team
 from data import PLAYERS, SQUADS
 from validate import validate_team
 
@@ -71,8 +71,8 @@ with st.form("team_generator"):
         ["Simple demo", "Agent learning mode"],
         default="Simple demo",
         help=(
-            "Simple demo uses one Groq request. Agent learning mode preserves the "
-            "LangGraph tool-calling workflow and can use several requests."
+            "Both modes use one Groq request. Agent learning mode shows the same "
+            "generation inside a small LangGraph validation workflow."
         ),
     )
     submitted = st.form_submit_button("Generate my XI", type="primary")
@@ -84,13 +84,15 @@ st.session_state.setdefault("generated_team", None)
 if submitted:
     message = "Generating from local sample data with one Groq request..."
     if mode == "Agent learning mode":
-        message = "The learning agent is calling sample-data tools and reasoning..."
+        message = "Running LangGraph: generate team, then validate and repair in Python..."
     with st.spinner(message):
         team = _pick_team_safely(match, mode)
     st.session_state.generated_team = team
 
 team = st.session_state.generated_team
 if team is not None:
+    if mode == "Agent learning mode":
+        st.caption("LangGraph: START → AI generation → Python validation/repair → END")
     st.subheader(f"Your sample-data XI — {team.match}")
     c1, c2 = st.columns(2)
     c1.metric("Captain (2x)", team.captain)

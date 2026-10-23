@@ -18,7 +18,6 @@ from agent import (
     GroqMalformedJSONError,
     GroqTruncatedOutputError,
     GroqValidationError,
-    _make_llm,
     pick_team_demo,
     rate_limit_message,
 )
@@ -71,7 +70,6 @@ def test_tools():
 
 def test_groq_client_safety_settings():
     with patch.dict(os.environ, {"GROQ_API_KEY": "offline-test-only"}):
-        llm = _make_llm()
         demo = agent._make_demo_llm()
     assert demo.max_retries == 0
     assert demo.max_tokens == 2000
@@ -79,9 +77,6 @@ def test_groq_client_safety_settings():
     assert "response_format" not in demo.model_kwargs
     assert "tools" not in demo.model_kwargs
     assert ssl.SSLContext.__module__ == "truststore._api"
-    assert llm.request_timeout == 60
-    assert llm.max_retries == 0
-    assert llm.model_kwargs["parallel_tool_calls"] is False
 
 
 def test_demo_uses_one_request_and_repairs_locally():
@@ -220,28 +215,24 @@ def test_repair_ten_players_from_one_team():
     assert repaired.captain != repaired.vice_captain
 
 
-def test_correction_provider_failure_uses_deterministic_repair():
-    names = [
-        "MS Dhoni", "Ruturaj Gaikwad", "Devon Conway", "Ajinkya Rahane",
-        "Shivam Dube", "Ravindra Jadeja", "Deepak Chahar",
-        "Matheesha Pathirana", "Maheesh Theekshana", "Tushar Deshpande",
-        "Jasprit Bumrah",
-    ]
-    invalid_team = _make_team(names)
+def test_langgraph_integration_uses_one_generation():
+    import learning_graph
 
-    with (
-        patch("agent._make_agent", return_value=object()),
-        patch(
-            "agent._invoke_agent",
-            side_effect=[{"messages": []}, RuntimeError("provider unavailable")],
-        ),
-        patch("agent._structured_team", return_value=invalid_team),
-    ):
-        repaired = agent.pick_team("CSK vs MI")
+    team = _valid_sample()
+    graph = learning_graph.TEAM_GRAPH.get_graph()
+    assert {"__start__", "generate_team", "validate_and_repair", "__end__"} <= set(graph.nodes)
+    assert {
+        ("__start__", "generate_team"),
+        ("generate_team", "validate_and_repair"),
+        ("validate_and_repair", "__end__"),
+    } <= {(edge.source, edge.target) for edge in graph.edges}
 
-    issues, meta = validate_team(repaired)
-    assert not issues
-    assert meta["teams"] == {"CSK": 7, "MI": 4}
+    with patch("learning_graph.pick_team_demo", return_value=team) as generate:
+        result = learning_graph.pick_team("CSK vs MI")
+
+    generate.assert_called_once_with("CSK vs MI", verbose=False)
+    assert isinstance(result, Team)
+    assert not validate_team(result)[0]
 
 
 def test_captain_not_in_xi():
@@ -385,6 +376,21 @@ def test_streamlit_distinguishes_output_and_http_errors():
             assert "sensitive" not in app.error[0].value
 
 
+def test_streamlit_agent_mode_runs_langgraph_and_displays_team():
+    from streamlit.testing.v1 import AppTest
+
+    with patch.dict(os.environ, {"GROQ_API_KEY": "offline-test-only"}):
+        app = AppTest.from_file("app.py").run()
+        app.segmented_control[0].select("Agent learning mode").run()
+        with patch("learning_graph.pick_team", return_value=_valid_sample()) as picker:
+            app.button[0].click().run()
+
+    picker.assert_called_once_with("CSK vs MI", verbose=False)
+    assert not app.exception and not app.error
+    assert len(app.table[0].value) == 11
+    assert any("LangGraph: START" in caption.value for caption in app.caption)
+
+
 def test_incomplete_response_is_not_repaired_or_retried():
     llm = Mock()
     llm.invoke.return_value = AIMessage(content='{"players":[0,1', response_metadata={"finish_reason": "length"}, usage_metadata={"input_tokens": 800, "output_tokens": 2000, "total_tokens": 2800})
@@ -457,6 +463,7 @@ if __name__ == "__main__":
         test_demo_provider_error_never_retries,
         test_streamlit_success_and_safe_errors,
         test_streamlit_distinguishes_output_and_http_errors,
+        test_streamlit_agent_mode_runs_langgraph_and_displays_team,
         test_tools,
         test_groq_client_safety_settings,
         test_demo_uses_one_request_and_repairs_locally,
@@ -467,7 +474,7 @@ if __name__ == "__main__":
         test_wrong_roles,
         test_team_cap,
         test_repair_ten_players_from_one_team,
-        test_correction_provider_failure_uses_deterministic_repair,
+        test_langgraph_integration_uses_one_generation,
         test_captain_not_in_xi,
     ]
     for test in tests:

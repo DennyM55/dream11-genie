@@ -15,7 +15,9 @@ python -m streamlit run app.py
 
 Set `GROQ_API_KEY` securely in your environment or copy `.env.example` to `.env` and enter your key locally. Never commit credentials. `GROQ_MODEL` is optional; Simple demo defaults to `openai/gpt-oss-20b`.
 
-Simple demo sends one compact request with local sample evidence. It requests only 11 fixture-local integer player IDs, captain/vice-captain IDs, and a short strategy as plain JSON. Python maps names, roles, teams, credits, and sample-data reasons from canonical local data, validates locally, and deterministically repairs rule violations. There is no provider-side schema enforcement or tool calling in Simple demo. Empty, malformed, truncated, or unusable responses produce an error. Requests are not automatically retried. Agent learning mode preserves the LangGraph tool workflow and may consume several requests; use Simple demo for the portfolio.
+Simple demo sends one compact request with local sample evidence. It requests only 11 fixture-local integer player IDs, captain/vice-captain IDs, and a short strategy as plain JSON. Python maps names, roles, teams, credits, and sample-data reasons from canonical local data, validates locally, and deterministically repairs rule violations. There is no provider-side schema enforcement or tool calling. Empty, malformed, truncated, or unusable responses produce an error. Requests are not automatically retried.
+
+Agent learning mode runs that exact generation function in a real LangGraph `StateGraph`: `START → AI generation → Python validation/repair → END`. It adds no model calls, retries, or provider-side schemas.
 
 ## Verify
 

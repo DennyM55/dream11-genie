@@ -8,7 +8,7 @@ Usage:
 """
 import sys
 
-from agent import pick_team
+from learning_graph import pick_team
 from validate import validate_team
 
 
