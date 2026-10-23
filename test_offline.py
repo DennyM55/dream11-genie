@@ -49,7 +49,7 @@ def test_tools():
 def test_valid_team():
     names = [
         "MS Dhoni",
-        "Ruturaj Gaikwad",
+        "Ajinkya Rahane",
         "Devon Conway",
         "Suryakumar Yadav",
         "Ravindra Jadeja",
